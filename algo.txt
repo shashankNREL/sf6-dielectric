@@ -1,0 +1,15 @@
+Let me build you an interactive visual explainer for this.Here's an interactive step-by-step explainer. Work through each stage with the buttons — the NSGA-II loop is the centrepiece.Step through all 8 stages using the buttons — each one covers a distinct concept. Here is the plain-language summary to accompany each stage.
+
+---
+
+**NSGA-II** stands for Non-dominated Sorting Genetic Algorithm II, published by Deb et al. in 2002. It is an *evolutionary* algorithm — it maintains a population of candidate solutions and improves them over generations through selection, crossover, and mutation, exactly like a biological population evolving under selection pressure. What makes it specific to multi-objective problems is the two-stage selection rule that runs at the start of every generation:
+
+First, *non-dominated sorting*. A molecule A is said to dominate B if it is at least as good as B on every objective and strictly better on at least one. NSGA-II repeatedly finds all non-dominated molecules (rank 1, the current Pareto front), removes them, finds the next non-dominated set (rank 2), and so on. Rank 1 molecules are always preferred over rank 2, rank 2 over rank 3, etc.
+
+Second, *crowding distance*. Within the same rank, molecules that are isolated along the front are preferred over clustered ones. This is measured by the perimeter of the bounding box formed by a molecule's two nearest neighbours in objective space — a larger box means the molecule occupies a part of the front no one else does, so it is more valuable for coverage.
+
+The SELFIES encoding in section 4 makes this tractable. Because SELFIES guarantees every string decodes to a valid molecule, the mutation and crossover operators never produce garbage that must be thrown away — every offspring can be evaluated immediately by the surrogate models, which is critical when the population is 80 molecules reproducing for 100 generations.
+
+Section 6 converts the three physical objectives into the minimisation form pymoo requires. Dielectric strength is negated (f1 = −DS) so the algorithm minimises it rather than maximising. Boiling point and log-GWP are already minimised naturally. The three inequality constraints (DS ≥ 0.7, BP ≤ 20°C, GWP ≤ 5000) are enforced by ranking infeasible molecules after all feasible ones — a simple penalty-free constraint handling method that comes built into pymoo.
+
+Section 7 produces the final Pareto front and ranks its members by hypervolume contribution. The hypervolume of a front is the volume of objective space dominated by the front below a reference point — a single number summarising how good the entire set of trade-offs is. Each molecule's individual contribution is how much the total hypervolume shrinks if you remove it. Molecules at the convex corners of the front (which cover objective space no other molecule reaches) have high contribution and are sent to DFT for validation first. Interior clustered molecules contribute almost nothing and are deprioritised.
