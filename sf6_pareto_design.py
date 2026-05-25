@@ -481,6 +481,18 @@ F_TOKENS = [t for t in SELFIES_ALPHABET if "F" in t]  # noqa: W605
 SELFIES_ALPHABET = SELFIES_ALPHABET + F_TOKENS * 3  # oversample F-containing
 
 MAX_SELFIES_LEN = 20  # max tokens per molecule
+INVALID_CONSTRAINT_PENALTY = 1e3
+PRIORITY_SCORE_WEIGHTS = {
+    "hypervolume": 0.65,
+    "in_domain": 0.20,
+    "certainty": 0.15,
+}
+ACTIVE_LEARNING_SCORE_WEIGHTS = {
+    "hypervolume": 0.40,
+    "novelty": 0.30,
+    "uncertainty": 0.20,
+    "in_domain": 0.10,
+}
 
 
 def smiles_to_selfies_safe(smiles: str) -> str | None:
@@ -595,13 +607,13 @@ class SF6ReplacementProblem(ElementwiseProblem):
             else:
                 # Invalid molecule — penalise heavily
                 out["F"] = [10.0, 200.0, 5.0]
-                out["G"] = [1e3, 1e3, 1e3]
+                out["G"] = [INVALID_CONSTRAINT_PENALTY] * 3
             return
 
         feats = self.feature_fn(smiles)
         if feats is None:
             out["F"] = [10.0, 200.0, 5.0]
-            out["G"] = [1e3, 1e3, 1e3]
+            out["G"] = [INVALID_CONSTRAINT_PENALTY] * 3
             return
 
         x_vec = np.array(list(feats.values()), dtype=float)
@@ -842,7 +854,11 @@ def add_candidate_priority_scores(df: pd.DataFrame,
     in_domain_bonus = df["in_domain"].astype(float).values
 
     df["uncertainty_score"] = uncertainty_norm
-    df["priority_score"] = 0.65 * hv_norm + 0.20 * in_domain_bonus + 0.15 * (1.0 - uncertainty_norm)
+    df["priority_score"] = (
+        PRIORITY_SCORE_WEIGHTS["hypervolume"] * hv_norm +
+        PRIORITY_SCORE_WEIGHTS["in_domain"] * in_domain_bonus +
+        PRIORITY_SCORE_WEIGHTS["certainty"] * (1.0 - uncertainty_norm)
+    )
     return df.sort_values(["in_domain", "priority_score", "hv_contrib"],
                           ascending=[False, False, False])
 
@@ -1079,7 +1095,7 @@ def main():
         print(f"    BP (pred):      {best['bp_pred']:.1f} °C")
         print(f"    BP uncertainty: ±{best['bp_std']:.1f} °C")
         print(f"    GWP (pred):     {best['gwp_pred']:.0f}")
-        print(f"    GWP uncertainty:±{best['gwp_std']:.0f}")
+        print(f"    GWP uncertainty: ±{best['gwp_std']:.0f}")
         print(f"    In domain:      {best['in_domain']}")
 
     print("\n  Next steps:")
@@ -1197,10 +1213,10 @@ def active_learning_round(df_pareto: pd.DataFrame,
     uncertainty_norm = normalize_series(uncertainty_raw)
 
     feasible["acq_score"] = (
-        0.40 * hv_norm +
-        0.30 * dists_norm +
-        0.20 * uncertainty_norm +
-        0.10 * feasible["in_domain"].astype(float).values
+        ACTIVE_LEARNING_SCORE_WEIGHTS["hypervolume"] * hv_norm +
+        ACTIVE_LEARNING_SCORE_WEIGHTS["novelty"] * dists_norm +
+        ACTIVE_LEARNING_SCORE_WEIGHTS["uncertainty"] * uncertainty_norm +
+        ACTIVE_LEARNING_SCORE_WEIGHTS["in_domain"] * feasible["in_domain"].astype(float).values
     )
     return feasible.nlargest(n_select, "acq_score")[
         [
