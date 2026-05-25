@@ -364,6 +364,8 @@ class SurrogateEnsemble:
             )
             member_preds = self._inverse_transform_target(name, member_preds)
             means.append(member_preds.mean(axis=1))
+            # Population-style spread across ensemble members is intentional:
+            # we want model disagreement, not an unbiased sample estimate.
             stds.append(member_preds.std(axis=1, ddof=0))
         return np.column_stack(means), np.column_stack(stds)
 
@@ -433,6 +435,9 @@ class SurrogateEnsemble:
     def applicability_domain_details(self, X_new: np.ndarray) -> dict[str, np.ndarray]:
         """
         Conservative AD check using both leverage and local distance.
+        A candidate is marked in-domain only when it passes both tests; this
+        favors precision over recall so the optimiser cannot rely on a single
+        permissive trust signal when extrapolating.
         """
         if self.feature_scaler is None or self._nn_model is None:
             raise RuntimeError("Surrogate must be fit before calling applicability_domain.")
@@ -607,12 +612,15 @@ class SF6ReplacementProblem(ElementwiseProblem):
             else:
                 # Invalid molecule — penalise heavily
                 out["F"] = [10.0, 200.0, 5.0]
+                # Positive inequality values are constraint violations in pymoo,
+                # so invalid molecules are explicitly infeasible.
                 out["G"] = [INVALID_CONSTRAINT_PENALTY] * 3
             return
 
         feats = self.feature_fn(smiles)
         if feats is None:
             out["F"] = [10.0, 200.0, 5.0]
+            # Positive penalty keeps feature-generation failures infeasible.
             out["G"] = [INVALID_CONSTRAINT_PENALTY] * 3
             return
 
@@ -848,6 +856,8 @@ def add_candidate_priority_scores(df: pd.DataFrame,
     uncertainty_raw = (
         df["ds_std"].values / max(property_scales["ds_rel"], 1e-8) +
         df["bp_std"].values / max(property_scales["bp_c"], 1e-8) +
+        # GWP spans orders of magnitude, so compress its uncertainty on log scale
+        # before combining it with the narrower DS/BP uncertainties.
         np.log10(1.0 + df["gwp_std"].values) / max(property_scales["gwp100_log"], 1e-8)
     )
     uncertainty_norm = normalize_series(uncertainty_raw)
@@ -1183,13 +1193,13 @@ def active_learning_round(df_pareto: pd.DataFrame,
     F_arr = feasible[["f1_neg_ds", "f2_bp", "f3_logGWP"]].values
     feasible["hv_contrib"] = hypervolume_contribution(F_arr)
 
-    # Exploration: compute distance from each candidate to training set
+    # Exploration: compute distance from each candidate to the training set
     X_train = surrogate.X_train_scaled
-    dists = []
+    X_candidates = []
     for _, row in feasible.iterrows():
         feats = feature_fn(row["smiles"])
         if feats is None:
-            dists.append(0.0)
+            X_candidates.append(np.zeros(X_train.shape[1], dtype=float))
             continue
         x = np.array(list(feats.values()), dtype=float)
         x = np.nan_to_num(x)
@@ -1198,11 +1208,14 @@ def active_learning_round(df_pareto: pd.DataFrame,
             x = np.pad(x, (0, n_feat - len(x)))
         else:
             x = x[:n_feat]
-        x_scaled = surrogate.feature_scaler.transform(x.reshape(1, -1))[0]
-        d = np.min(np.linalg.norm(X_train - x_scaled, axis=1))
-        dists.append(d)
+        X_candidates.append(surrogate.feature_scaler.transform(x.reshape(1, -1))[0])
 
-    dists = np.array(dists)
+    X_candidates = np.vstack(X_candidates)
+    pairwise_dists = np.linalg.norm(
+        X_candidates[:, None, :] - X_train[None, :, :],
+        axis=2,
+    )
+    dists = pairwise_dists.min(axis=1)
     dists_norm = (dists - dists.min()) / (dists.max() - dists.min() + 1e-8)
     hv_norm = normalize_series(feasible["hv_contrib"].values)
     uncertainty_raw = (
