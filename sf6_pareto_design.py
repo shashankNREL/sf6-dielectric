@@ -18,21 +18,21 @@ Dependencies (install order matters):
 """
 
 # ── stdlib ──────────────────────────────────────────────────────────────────
-import warnings, json, pathlib, random
-from copy import deepcopy
+import warnings, pathlib, random
 
 # ── numerics & ML ───────────────────────────────────────────────────────────
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
-from sklearn.model_selection import cross_val_score, KFold
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.model_selection import KFold, train_test_split
 from sklearn.metrics import r2_score, mean_absolute_error
+from sklearn.neighbors import NearestNeighbors
 from sklearn.pipeline import Pipeline
 
 # ── cheminformatics ──────────────────────────────────────────────────────────
 from rdkit import Chem
-from rdkit.Chem import Descriptors, rdMolDescriptors, AllChem, Draw
+from rdkit.Chem import Descriptors, rdMolDescriptors, AllChem
 from rdkit.Chem.rdMolDescriptors import CalcTPSA
 try:
     from mordred import Calculator, descriptors as mordred_descs
@@ -45,21 +45,15 @@ import selfies as sf
 
 # ── multi-objective optimisation ─────────────────────────────────────────────
 from pymoo.algorithms.moo.nsga2 import NSGA2
-from pymoo.algorithms.moo.nsga3 import NSGA3
 from pymoo.core.problem import ElementwiseProblem
 from pymoo.core.mutation import Mutation
 from pymoo.core.crossover import Crossover
 from pymoo.core.sampling import Sampling
 from pymoo.optimize import minimize
-from pymoo.util.ref_dirs import get_reference_directions
 from pymoo.indicators.hv import HV
 
 # ── visualisation ────────────────────────────────────────────────────────────
 import matplotlib.pyplot as plt
-import matplotlib.cm as cm
-import seaborn as sns
-
-warnings.filterwarnings("ignore")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -277,18 +271,54 @@ class SurrogateEnsemble:
       - boiling point in °C                 (minimise: want < −10°C)
       - GWP 100-yr                          (minimise)
 
-    Includes a simple applicability domain check via leverage statistics.
+    Uses bootstrap ensembles for uncertainty estimates and combines leverage
+    with nearest-neighbour distance for a more conservative applicability
+    domain check.
     """
 
     OBJECTIVES = ["ds_rel", "bp_c", "gwp100"]
+    TARGET_TRANSFORMS = {
+        "ds_rel": "identity",
+        "bp_c": "identity",
+        "gwp100": "log10",
+    }
 
-    def __init__(self, n_estimators=200, max_depth=4):
+    def __init__(self, n_estimators=200, max_depth=4, n_members: int = 7):
         self.models = {}
-        self.scalers = {}
         self.X_train = None
         self.n_estimators = n_estimators
         self.max_depth = max_depth
+        self.n_members = n_members
         self._trained = False
+        self.feature_scaler = None
+        self.X_train_scaled = None
+        self._nn_model = None
+        self._distance_threshold = None
+        self._h_star = None
+
+    def _base_estimator(self, random_state: int) -> Pipeline:
+        return Pipeline([
+            ("scaler", StandardScaler()),
+            ("model", GradientBoostingRegressor(
+                n_estimators=self.n_estimators,
+                max_depth=self.max_depth,
+                learning_rate=0.05,
+                subsample=0.8,
+                random_state=random_state,
+            )),
+        ])
+
+    def _transform_target(self, name: str, y: np.ndarray) -> np.ndarray:
+        y = np.asarray(y, dtype=float)
+        if self.TARGET_TRANSFORMS[name] == "log10":
+            return np.log10(np.clip(y, 1.0, None))
+        return y
+
+    def _inverse_transform_target(self, name: str, y: np.ndarray) -> np.ndarray:
+        y = np.asarray(y, dtype=float)
+        if self.TARGET_TRANSFORMS[name] == "log10":
+            return np.power(10.0, y)
+        return y
 
     def fit(self, X: np.ndarray, Y: np.ndarray):
         """
@@ -297,71 +327,138 @@ class SurrogateEnsemble:
         """
         assert Y.shape[1] == 3, "Y must have 3 columns: ds_rel, bp_c, gwp100"
         self.X_train = X.copy()
+        self.feature_scaler = StandardScaler().fit(X)
+        self.X_train_scaled = self.feature_scaler.transform(X)
 
+        rng = np.random.default_rng(42)
         for i, name in enumerate(self.OBJECTIVES):
-            scaler = StandardScaler()
-            Xs = scaler.fit_transform(X)
-            y = Y[:, i]
-            model = GradientBoostingRegressor(
-                n_estimators=self.n_estimators,
-                max_depth=self.max_depth,
-                learning_rate=0.05,
-                subsample=0.8,
-                random_state=42,
-            )
-            model.fit(Xs, y)
-            self.models[name] = model
-            self.scalers[name] = scaler
+            y = self._transform_target(name, Y[:, i])
+            members = []
+            for member_idx in range(self.n_members):
+                sample_idx = rng.integers(0, len(X), size=len(X))
+                estimator = self._base_estimator(random_state=42 + member_idx)
+                estimator.fit(X[sample_idx], y[sample_idx])
+                members.append(estimator)
+            self.models[name] = members
+
+        n_neighbors = min(5, len(X))
+        self._nn_model = NearestNeighbors(n_neighbors=n_neighbors).fit(self.X_train_scaled)
+        train_dist, _ = self._nn_model.kneighbors(self.X_train_scaled)
+        if train_dist.shape[1] > 1:
+            train_mean_dist = train_dist[:, 1:].mean(axis=1)
+        else:
+            train_mean_dist = train_dist[:, 0]
+        self._distance_threshold = np.quantile(train_mean_dist, 0.95)
+        n_train, n_feat = self.X_train_scaled.shape
+        self._h_star = 3.0 * n_feat / max(n_train, 1)
 
         self._trained = True
         return self
 
+    def predict_with_uncertainty(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Returns mean/std arrays of shape (n, 3) on the raw property scales."""
+        means, stds = [], []
+        for name in self.OBJECTIVES:
+            member_preds = np.column_stack(
+                [member.predict(X) for member in self.models[name]]
+            )
+            member_preds = self._inverse_transform_target(name, member_preds)
+            means.append(member_preds.mean(axis=1))
+            stds.append(member_preds.std(axis=1, ddof=0))
+        return np.column_stack(means), np.column_stack(stds)
+
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Returns (n, 3) array of [ds_rel, bp_c, gwp100] predictions."""
-        preds = []
-        for name in self.OBJECTIVES:
-            Xs = self.scalers[name].transform(X)
-            preds.append(self.models[name].predict(Xs))
-        return np.column_stack(preds)
+        means, _ = self.predict_with_uncertainty(X)
+        return means
 
     def predict_single(self, x: np.ndarray) -> np.ndarray:
         return self.predict(x.reshape(1, -1))[0]
+
+    def predict_single_with_uncertainty(self, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        mean, std = self.predict_with_uncertainty(x.reshape(1, -1))
+        return mean[0], std[0]
 
     def cross_validate(self, X, Y, cv=5) -> dict:
         results = {}
         kf = KFold(n_splits=cv, shuffle=True, random_state=42)
         for i, name in enumerate(self.OBJECTIVES):
-            scaler = StandardScaler()
-            Xs = scaler.fit_transform(X)
-            scores = cross_val_score(
-                GradientBoostingRegressor(
-                    n_estimators=self.n_estimators,
-                    max_depth=self.max_depth,
-                    learning_rate=0.05,
-                    random_state=42,
-                ),
-                Xs, Y[:, i], cv=kf, scoring="r2"
-            )
-            results[name] = {"mean_r2": scores.mean(), "std_r2": scores.std()}
+            y_true = np.asarray(Y[:, i], dtype=float)
+            oof_pred = np.zeros_like(y_true, dtype=float)
+            for fold_idx, (train_idx, test_idx) in enumerate(kf.split(X)):
+                estimator = self._base_estimator(random_state=42 + fold_idx)
+                y_train = self._transform_target(name, y_true[train_idx])
+                estimator.fit(X[train_idx], y_train)
+                fold_pred = estimator.predict(X[test_idx])
+                oof_pred[test_idx] = self._inverse_transform_target(name, fold_pred)
+
+            rank_corr = pd.Series(y_true).corr(pd.Series(oof_pred), method="spearman")
+            residuals = y_true - oof_pred
+            results[name] = {
+                "r2": float(r2_score(y_true, oof_pred)),
+                "mae": float(mean_absolute_error(y_true, oof_pred)),
+                "rmse": float(np.sqrt(np.mean(np.square(residuals)))),
+                "spearman": float(0.0 if pd.isna(rank_corr) else rank_corr),
+            }
         return results
 
-    def applicability_domain(self, X_new: np.ndarray,
-                              threshold: float = 3.0) -> np.ndarray:
+    def holdout_evaluate(self, X, Y, test_size: float = 0.2,
+                         random_state: int = 42) -> dict:
+        X_train, X_test, Y_train, Y_test = train_test_split(
+            X, Y, test_size=test_size, random_state=random_state
+        )
+        holdout_model = SurrogateEnsemble(
+            n_estimators=self.n_estimators,
+            max_depth=self.max_depth,
+            n_members=self.n_members,
+        )
+        holdout_model.fit(X_train, Y_train)
+        preds, stds = holdout_model.predict_with_uncertainty(X_test)
+
+        results = {}
+        for i, name in enumerate(self.OBJECTIVES):
+            y_true = np.asarray(Y_test[:, i], dtype=float)
+            y_pred = preds[:, i]
+            rank_corr = pd.Series(y_true).corr(pd.Series(y_pred), method="spearman")
+            residuals = y_true - y_pred
+            results[name] = {
+                "r2": float(r2_score(y_true, y_pred)),
+                "mae": float(mean_absolute_error(y_true, y_pred)),
+                "rmse": float(np.sqrt(np.mean(np.square(residuals)))),
+                "spearman": float(0.0 if pd.isna(rank_corr) else rank_corr),
+                "mean_uncertainty": float(stds[:, i].mean()),
+            }
+        return results
+
+    def applicability_domain_details(self, X_new: np.ndarray) -> dict[str, np.ndarray]:
         """
-        Leverage-based AD check. Returns boolean mask: True = in domain.
-        h_i = x_i^T (X^T X)^{-1} x_i
-        Warning threshold h* = 3p/n where p = n_features, n = n_train.
+        Conservative AD check using both leverage and local distance.
         """
-        X = self.scalers["ds_rel"].transform(self.X_train)
-        Xn = self.scalers["ds_rel"].transform(X_new)
+        if self.feature_scaler is None or self._nn_model is None:
+            raise RuntimeError("Surrogate must be fit before calling applicability_domain.")
+
+        X = self.X_train_scaled
+        Xn = self.feature_scaler.transform(X_new)
         try:
             XtXinv = np.linalg.pinv(X.T @ X)
         except np.linalg.LinAlgError:
-            return np.ones(len(X_new), dtype=bool)
-        h_new = np.array([xn @ XtXinv @ xn for xn in Xn])
-        n, p = X.shape
-        h_star = threshold * p / n
-        return h_new <= h_star
+            h_new = np.zeros(len(X_new), dtype=float)
+        else:
+            h_new = np.array([xn @ XtXinv @ xn for xn in Xn])
+
+        dist, _ = self._nn_model.kneighbors(Xn)
+        mean_dist = dist.mean(axis=1)
+        in_domain = (h_new <= self._h_star) & (mean_dist <= self._distance_threshold)
+        return {
+            "in_domain": in_domain,
+            "leverage": h_new,
+            "h_star": np.full(len(X_new), self._h_star, dtype=float),
+            "nn_distance": mean_dist,
+            "distance_threshold": np.full(len(X_new), self._distance_threshold, dtype=float),
+        }
+
+    def applicability_domain(self, X_new: np.ndarray) -> np.ndarray:
+        return self.applicability_domain_details(X_new)["in_domain"]
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -498,13 +595,13 @@ class SF6ReplacementProblem(ElementwiseProblem):
             else:
                 # Invalid molecule — penalise heavily
                 out["F"] = [10.0, 200.0, 5.0]
-                out["G"] = [-1.0, -1.0, -1.0]  # all violated
+                out["G"] = [1e3, 1e3, 1e3]
             return
 
         feats = self.feature_fn(smiles)
         if feats is None:
             out["F"] = [10.0, 200.0, 5.0]
-            out["G"] = [-1.0, -1.0, -1.0]
+            out["G"] = [1e3, 1e3, 1e3]
             return
 
         x_vec = np.array(list(feats.values()), dtype=float)
@@ -523,7 +620,7 @@ class SF6ReplacementProblem(ElementwiseProblem):
         # Objectives (all minimised)
         f1 = -float(ds)                        # negate: maximise ds
         f2 = float(bp)                         # minimise boiling point
-        f3 = float(np.log10(max(gwp, 1.0)))    # log GWP
+        f3 = float(np.log10(max(gwp, 1.0)))    # minimise raw GWP on log scale
 
         # Inequality constraints (g_i <= 0 means satisfied)
         g1 = 0.7 - ds          # ds >= 0.7  →  0.7 - ds <= 0
@@ -664,21 +761,28 @@ def decode_population(res, alphabet: list[str],
         else:
             x_vec = x_vec[:n_feat]
 
-        in_domain = surrogate.applicability_domain(x_vec.reshape(1, -1))[0]
-        preds = surrogate.predict_single(x_vec)
+        ad = surrogate.applicability_domain_details(x_vec.reshape(1, -1))
+        preds, pred_std = surrogate.predict_single_with_uncertainty(x_vec)
         rows.append({
             "smiles":      smiles,
             "selfies":     sel,
             "ds_pred":     float(preds[0]),
             "bp_pred":     float(preds[1]),
             "gwp_pred":    float(preds[2]),
+            "ds_std":      float(pred_std[0]),
+            "bp_std":      float(pred_std[1]),
+            "gwp_std":     float(pred_std[2]),
             "f1_neg_ds":   float(f[0]),
             "f2_bp":       float(f[1]),
             "f3_logGWP":   float(f[2]),
             "g1_ds":       float(g[0]),
             "g2_bp":       float(g[1]),
             "g3_gwp":      float(g[2]),
-            "in_domain":   bool(in_domain),
+            "in_domain":   bool(ad["in_domain"][0]),
+            "ad_leverage": float(ad["leverage"][0]),
+            "ad_h_star":   float(ad["h_star"][0]),
+            "ad_nn_distance": float(ad["nn_distance"][0]),
+            "ad_distance_threshold": float(ad["distance_threshold"][0]),
             "feasible":    bool(all(gi <= 0 for gi in g)),
         })
     return pd.DataFrame(rows).drop_duplicates(subset="smiles")
@@ -703,6 +807,44 @@ def hypervolume_contribution(F: np.ndarray,
             hv_without = hv_calc.do(F_without_i)
             contribs[i] = total_hv - hv_without
     return contribs
+
+
+def normalize_series(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    if len(values) == 0:
+        return values
+    vmin = np.min(values)
+    vmax = np.max(values)
+    if np.isclose(vmin, vmax):
+        return np.zeros_like(values, dtype=float)
+    return (values - vmin) / (vmax - vmin)
+
+
+def add_candidate_priority_scores(df: pd.DataFrame,
+                                  property_scales: dict[str, float]) -> pd.DataFrame:
+    df = df.copy()
+    if df.empty:
+        df["hv_contrib"] = []
+        df["uncertainty_score"] = []
+        df["priority_score"] = []
+        return df
+
+    F = df[["f1_neg_ds", "f2_bp", "f3_logGWP"]].values
+    df["hv_contrib"] = hypervolume_contribution(F)
+    hv_norm = normalize_series(df["hv_contrib"].values)
+
+    uncertainty_raw = (
+        df["ds_std"].values / max(property_scales["ds_rel"], 1e-8) +
+        df["bp_std"].values / max(property_scales["bp_c"], 1e-8) +
+        np.log10(1.0 + df["gwp_std"].values) / max(property_scales["gwp100_log"], 1e-8)
+    )
+    uncertainty_norm = normalize_series(uncertainty_raw)
+    in_domain_bonus = df["in_domain"].astype(float).values
+
+    df["uncertainty_score"] = uncertainty_norm
+    df["priority_score"] = 0.65 * hv_norm + 0.20 * in_domain_bonus + 0.15 * (1.0 - uncertainty_norm)
+    return df.sort_values(["in_domain", "priority_score", "hv_contrib"],
+                          ascending=[False, False, False])
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -816,17 +958,32 @@ def main():
 
     X = df_feats.values.astype(float)
     Y = df[["ds_rel", "bp_c", "gwp100"]].values.astype(float)
-    # Log-transform GWP for training stability
-    Y[:, 2] = np.log10(np.clip(Y[:, 2], 1, None))
     print(f"  Feature matrix: {X.shape[0]} samples × {X.shape[1]} features")
+    property_scales = {
+        "ds_rel": float(np.std(Y[:, 0]) + 1e-8),
+        "bp_c": float(np.std(Y[:, 1]) + 1e-8),
+        "gwp100_log": float(np.std(np.log10(np.clip(Y[:, 2], 1.0, None))) + 1e-8),
+    }
 
     # ── 9.3 Train & cross-validate surrogates ─────────────────────────────
-    print("\n[3/6] Training surrogate models (GBR) + 5-fold CV...")
-    surr = SurrogateEnsemble(n_estimators=300, max_depth=4)
+    print("\n[3/6] Training surrogate models (bootstrap GBR) + validation...")
+    surr = SurrogateEnsemble(n_estimators=300, max_depth=4, n_members=7)
+    holdout_results = surr.holdout_evaluate(X, Y, test_size=0.2, random_state=42)
     surr.fit(X, Y)
     cv_results = surr.cross_validate(X, Y, cv=5)
-    for prop, res in cv_results.items():
-        print(f"  {prop:10s}  CV R² = {res['mean_r2']:.3f} ± {res['std_r2']:.3f}")
+    for prop in surr.OBJECTIVES:
+        cv_res = cv_results[prop]
+        holdout_res = holdout_results[prop]
+        print(
+            f"  {prop:10s}  CV R²={cv_res['r2']:.3f}  RMSE={cv_res['rmse']:.3f}  "
+            f"MAE={cv_res['mae']:.3f}  ρ={cv_res['spearman']:.3f}"
+        )
+        print(
+            f"              Holdout R²={holdout_res['r2']:.3f}  "
+            f"RMSE={holdout_res['rmse']:.3f}  "
+            f"MAE={holdout_res['mae']:.3f}  "
+            f"mean σ={holdout_res['mean_uncertainty']:.3f}"
+        )
 
     # Store feature column names for alignment during optimisation
     feat_col_names = list(df_feats.columns)
@@ -883,24 +1040,20 @@ def main():
 
     df_pareto = decode_population(res, alphabet, surr, feature_fn_aligned)
 
-    # Convert log GWP back to linear for display
-    df_pareto["gwp_pred"] = np.power(10, df_pareto["gwp_pred"])
-
     # Rank by HV contribution (feasible only)
     feasible = df_pareto[df_pareto["feasible"]].copy()
     if not feasible.empty:
-        F_arr = feasible[["f1_neg_ds", "f2_bp", "f3_logGWP"]].values
-        feasible["hv_contrib"] = hypervolume_contribution(F_arr)
-        feasible = feasible.sort_values("hv_contrib", ascending=False)
+        feasible = add_candidate_priority_scores(feasible, property_scales)
 
     # Print top 10
-    print("\n  Top 10 candidates by hypervolume contribution:")
-    print(f"  {'SMILES':<45} {'DS':>6} {'BP':>7} {'GWP':>8} {'AD':>5}")
-    print("  " + "-" * 75)
+    print("\n  Top 10 candidates by risk-adjusted Pareto priority:")
+    print(f"  {'SMILES':<45} {'DS':>6} {'BP':>7} {'GWP':>8} {'σDS':>6} {'AD':>5}")
+    print("  " + "-" * 84)
     for _, row in feasible.head(10).iterrows():
         ad = "✓" if row["in_domain"] else "✗"
         print(f"  {row['smiles'][:44]:<44} {row['ds_pred']:>6.2f} "
-              f"{row['bp_pred']:>7.1f} {row['gwp_pred']:>8.0f} {ad:>5}")
+              f"{row['bp_pred']:>7.1f} {row['gwp_pred']:>8.0f} "
+              f"{row['ds_std']:>6.2f} {ad:>5}")
 
     # Save results
     out_dir = pathlib.Path("output")
@@ -908,15 +1061,6 @@ def main():
 
     feasible.to_csv(out_dir / "pareto_candidates.csv", index=False)
     print(f"\n  Full results saved to: {out_dir / 'pareto_candidates.csv'}")
-
-    # Reference: known candidates for comparison
-    known = {
-        "SF6":      {"ds": 1.00, "bp": -63.8, "gwp": 23500},
-        "C4F7N":    {"ds": 1.90, "bp":   0.0, "gwp":  2090},
-        "C5F10O":   {"ds": 1.75, "bp":  27.0, "gwp":     1},
-        "CF3I":     {"ds": 1.80, "bp": -22.5, "gwp":     1},
-        "C2F5I":    {"ds": 2.10, "bp":  13.0, "gwp":     1},
-    }
 
     plot_pareto_front(df_pareto, str(out_dir / "pareto_front.png"))
 
@@ -931,8 +1075,11 @@ def main():
         print(f"\n  Top candidate:")
         print(f"    SMILES:         {best['smiles']}")
         print(f"    DS (pred):      {best['ds_pred']:.2f} × SF6")
+        print(f"    DS uncertainty: ±{best['ds_std']:.2f}")
         print(f"    BP (pred):      {best['bp_pred']:.1f} °C")
+        print(f"    BP uncertainty: ±{best['bp_std']:.1f} °C")
         print(f"    GWP (pred):     {best['gwp_pred']:.0f}")
+        print(f"    GWP uncertainty:±{best['gwp_std']:.0f}")
         print(f"    In domain:      {best['in_domain']}")
 
     print("\n  Next steps:")
@@ -1011,21 +1158,17 @@ def active_learning_round(df_pareto: pd.DataFrame,
     """
     Select the most informative candidates for DFT validation using a
     combined acquisition function:
-      score = hv_contribution × exploration_bonus × domain_penalty
-
-    exploration_bonus = inverse distance to training set in feature space
-      (prefer candidates far from already-labelled molecules)
-    domain_penalty = 0 if outside AD, 1 if inside AD
+      score = Pareto value + novelty + uncertainty + domain bonus
     """
     feasible = df_pareto[df_pareto["feasible"] & df_pareto["in_domain"]].copy()
     if feasible.empty:
         return feasible
 
     F_arr = feasible[["f1_neg_ds", "f2_bp", "f3_logGWP"]].values
-    hv = hypervolume_contribution(F_arr)
+    feasible["hv_contrib"] = hypervolume_contribution(F_arr)
 
     # Exploration: compute distance from each candidate to training set
-    X_train = surrogate.X_train
+    X_train = surrogate.X_train_scaled
     dists = []
     for _, row in feasible.iterrows():
         feats = feature_fn(row["smiles"])
@@ -1039,16 +1182,33 @@ def active_learning_round(df_pareto: pd.DataFrame,
             x = np.pad(x, (0, n_feat - len(x)))
         else:
             x = x[:n_feat]
-        d = np.min(np.linalg.norm(X_train - x, axis=1))
+        x_scaled = surrogate.feature_scaler.transform(x.reshape(1, -1))[0]
+        d = np.min(np.linalg.norm(X_train - x_scaled, axis=1))
         dists.append(d)
 
     dists = np.array(dists)
     dists_norm = (dists - dists.min()) / (dists.max() - dists.min() + 1e-8)
-    hv_norm = (hv - hv.min()) / (hv.max() - hv.min() + 1e-8)
+    hv_norm = normalize_series(feasible["hv_contrib"].values)
+    uncertainty_raw = (
+        feasible["ds_std"].values / max(np.std(feasible["ds_pred"].values), 1e-8) +
+        feasible["bp_std"].values / max(np.std(feasible["bp_pred"].values), 1e-8) +
+        np.log10(1.0 + feasible["gwp_std"].values)
+    )
+    uncertainty_norm = normalize_series(uncertainty_raw)
 
-    feasible["acq_score"] = 0.6 * hv_norm + 0.4 * dists_norm
+    feasible["acq_score"] = (
+        0.40 * hv_norm +
+        0.30 * dists_norm +
+        0.20 * uncertainty_norm +
+        0.10 * feasible["in_domain"].astype(float).values
+    )
     return feasible.nlargest(n_select, "acq_score")[
-        ["smiles", "ds_pred", "bp_pred", "gwp_pred", "acq_score", "hv_contrib"]
+        [
+            "smiles", "ds_pred", "bp_pred", "gwp_pred",
+            "ds_std", "bp_std", "gwp_std",
+            "acq_score", "hv_contrib",
+            "ad_leverage", "ad_nn_distance",
+        ]
     ]
 
 
