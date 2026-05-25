@@ -283,7 +283,8 @@ class SurrogateEnsemble:
         "gwp100": "log10",
     }
 
-    def __init__(self, n_estimators=200, max_depth=4, n_members: int = 7):
+    def __init__(self, n_estimators: int = 200, max_depth: int = 4,
+                 n_members: int = 7):
         self.models = {}
         self.X_train = None
         self.n_estimators = n_estimators
@@ -311,7 +312,7 @@ class SurrogateEnsemble:
     def _transform_target(self, name: str, y: np.ndarray) -> np.ndarray:
         y = np.asarray(y, dtype=float)
         if self.TARGET_TRANSFORMS[name] == "log10":
-            return np.log10(np.clip(y, 1.0, None))
+            return np.log10(np.clip(y, MIN_GWP_FOR_LOG, None))
         return y
 
     def _inverse_transform_target(self, name: str, y: np.ndarray) -> np.ndarray:
@@ -335,6 +336,8 @@ class SurrogateEnsemble:
             y = self._transform_target(name, Y[:, i])
             members = []
             for member_idx in range(self.n_members):
+                # Bootstrap resampling with replacement creates diverse members
+                # from the same small dataset for uncertainty estimation.
                 sample_idx = rng.integers(0, len(X), size=len(X))
                 estimator = self._base_estimator(random_state=42 + member_idx)
                 estimator.fit(X[sample_idx], y[sample_idx])
@@ -365,7 +368,8 @@ class SurrogateEnsemble:
             member_preds = self._inverse_transform_target(name, member_preds)
             means.append(member_preds.mean(axis=1))
             # Population-style spread across ensemble members is intentional:
-            # we want model disagreement, not an unbiased sample estimate.
+            # this estimates epistemic uncertainty (model disagreement), not
+            # aleatoric noise in the experimental labels.
             stds.append(member_preds.std(axis=1, ddof=0))
         return np.column_stack(means), np.column_stack(stds)
 
@@ -486,6 +490,8 @@ F_TOKENS = [t for t in SELFIES_ALPHABET if "F" in t]  # noqa: W605
 SELFIES_ALPHABET = SELFIES_ALPHABET + F_TOKENS * 3  # oversample F-containing
 
 MAX_SELFIES_LEN = 20  # max tokens per molecule
+MIN_GWP_FOR_LOG = 1.0
+GWP_UNCERTAINTY_OFFSET = 1.0
 INVALID_CONSTRAINT_PENALTY = 1e3
 PRIORITY_SCORE_WEIGHTS = {
     "hypervolume": 0.65,
@@ -613,7 +619,8 @@ class SF6ReplacementProblem(ElementwiseProblem):
                 # Invalid molecule — penalise heavily
                 out["F"] = [10.0, 200.0, 5.0]
                 # Positive inequality values are constraint violations in pymoo,
-                # so invalid molecules are explicitly infeasible.
+                # so invalid molecules are explicitly infeasible. The magnitude
+                # is set far above the real constraint scales used here.
                 out["G"] = [INVALID_CONSTRAINT_PENALTY] * 3
             return
 
@@ -640,7 +647,7 @@ class SF6ReplacementProblem(ElementwiseProblem):
         # Objectives (all minimised)
         f1 = -float(ds)                        # negate: maximise ds
         f2 = float(bp)                         # minimise boiling point
-        f3 = float(np.log10(max(gwp, 1.0)))    # minimise raw GWP on log scale
+        f3 = float(np.log10(max(gwp, MIN_GWP_FOR_LOG)))  # minimise GWP on log10 scale
 
         # Inequality constraints (g_i <= 0 means satisfied)
         g1 = 0.7 - ds          # ds >= 0.7  →  0.7 - ds <= 0
@@ -858,7 +865,8 @@ def add_candidate_priority_scores(df: pd.DataFrame,
         df["bp_std"].values / max(property_scales["bp_c"], 1e-8) +
         # GWP spans orders of magnitude, so compress its uncertainty on log scale
         # before combining it with the narrower DS/BP uncertainties.
-        np.log10(1.0 + df["gwp_std"].values) / max(property_scales["gwp100_log"], 1e-8)
+        np.log10(GWP_UNCERTAINTY_OFFSET + df["gwp_std"].values) /
+        max(property_scales["gwp100_log"], 1e-8)
     )
     uncertainty_norm = normalize_series(uncertainty_raw)
     in_domain_bonus = df["in_domain"].astype(float).values
@@ -1196,11 +1204,14 @@ def active_learning_round(df_pareto: pd.DataFrame,
     # Exploration: compute distance from each candidate to the training set
     X_train = surrogate.X_train_scaled
     X_candidates = []
+    valid_candidate_mask = []
     for _, row in feasible.iterrows():
         feats = feature_fn(row["smiles"])
         if feats is None:
-            X_candidates.append(np.zeros(X_train.shape[1], dtype=float))
+            valid_candidate_mask.append(False)
+            X_candidates.append(np.full(X_train.shape[1], np.nan, dtype=float))
             continue
+        valid_candidate_mask.append(True)
         x = np.array(list(feats.values()), dtype=float)
         x = np.nan_to_num(x)
         n_feat = X_train.shape[1]
@@ -1211,11 +1222,14 @@ def active_learning_round(df_pareto: pd.DataFrame,
         X_candidates.append(surrogate.feature_scaler.transform(x.reshape(1, -1))[0])
 
     X_candidates = np.vstack(X_candidates)
-    pairwise_dists = np.linalg.norm(
-        X_candidates[:, None, :] - X_train[None, :, :],
-        axis=2,
-    )
-    dists = pairwise_dists.min(axis=1)
+    dists = np.zeros(len(feasible), dtype=float)
+    if any(valid_candidate_mask):
+        valid_candidates = X_candidates[np.array(valid_candidate_mask)]
+        pairwise_dists = np.linalg.norm(
+            valid_candidates[:, None, :] - X_train[None, :, :],
+            axis=2,
+        )
+        dists[np.array(valid_candidate_mask)] = pairwise_dists.min(axis=1)
     dists_norm = (dists - dists.min()) / (dists.max() - dists.min() + 1e-8)
     hv_norm = normalize_series(feasible["hv_contrib"].values)
     uncertainty_raw = (
